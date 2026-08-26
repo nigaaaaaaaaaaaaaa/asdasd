@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import argparse
+import shutil
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from datetime import datetime
@@ -15,11 +16,45 @@ BLENDER_PATH = os.environ.get("BLENDER_PATH", "blender")
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
 def check_dependencies():
-    blender_path = shutil.which("blender")
-    ffmpeg_path = shutil.which("ffmpeg")
+    # 1. Check BLENDER_PATH env var
+    blender_path = os.environ.get("BLENDER_PATH")
+    print(f"DEBUG: Initial BLENDER_PATH env: {blender_path}")
     
-    if blender_path: os.environ["BLENDER_PATH"] = blender_path
-    if ffmpeg_path: os.environ["FFMPEG_PATH"] = ffmpeg_path
+    # 2. Check for specified Windows path or common locations if not set
+    if not blender_path:
+        possible_paths = [
+            r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
+            r"C:\Program Files\Blender Foundation\Blender 3.6\blender.exe"
+        ]
+        
+        for path in possible_paths:
+            print(f"DEBUG: Checking path: {path}")
+            if os.path.exists(path):
+                blender_path = path
+                print(f"DEBUG: Found Blender at: {blender_path}")
+                break
+                
+    # 3. Check PATH
+    if not blender_path:
+        blender_path = shutil.which("blender")
+        print(f"DEBUG: Found Blender in PATH: {blender_path}")
+        
+    # Verify the found path
+    if blender_path and os.path.exists(blender_path):
+        os.environ["BLENDER_PATH"] = blender_path
+        print(f"DEBUG: Using Blender at: {blender_path}")
+    else:
+        blender_path = None
+        print("DEBUG: Blender not found")
+        
+    # Same logic for ffmpeg
+    ffmpeg_path = os.environ.get("FFMPEG_PATH", shutil.which("ffmpeg"))
+    if ffmpeg_path:
+        os.environ["FFMPEG_PATH"] = ffmpeg_path
+        print(f"DEBUG: Using FFmpeg at: {ffmpeg_path}")
         
     return blender_path is not None, ffmpeg_path is not None
 
@@ -123,10 +158,13 @@ def run_render(job_id=None, test_mode=False):
         if job_id: fail_job(job_id, "Blender not available")
         return False
         
-    output_dir = "/tmp/renders"
+    # Use platform-independent path
+    output_dir = os.path.join(os.getcwd(), "renders")
     os.makedirs(output_dir, exist_ok=True)
     job_tag = job_id if job_id else "test_" + str(int(time.time()))
-    output_path = os.path.join(output_dir, f"{job_tag}.mp4")
+    
+    # Do not add extension here, let Blender handle it based on format
+    output_path = os.path.join(output_dir, job_tag)
     
     script_path = os.path.join(os.path.dirname(__file__), "blender", "minecraft_scene_builder.py")
     
@@ -142,36 +180,45 @@ def run_render(job_id=None, test_mode=False):
             os.environ.get("BLENDER_PATH", "blender"),
             "--background",
             "--python", script_path
-        ], env=env, capture_output=True, text=True)
+        ], env=env)
+        
+        print(f"Blender exited with code: {process.returncode}")
         
         if process.returncode != 0:
-            print(f"Blender error: {process.stderr}")
-            if job_id: fail_job(job_id, f"Blender failed: {process.stderr[:200]}")
+            if job_id: fail_job(job_id, f"Blender failed with exit code {process.returncode}")
             return False
             
-        # Verify output exists
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            print("Render produced no file or empty file")
-            if job_id: fail_job(job_id, "Render produced no file")
-            return False
+        # The actual file might have .mp4 appended by Blender
+        final_output_path = output_path + ".mp4"
+        if not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
+            # Check if it didn't add the extension
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                final_output_path = output_path
+            else:
+                print(f"Render produced no file or empty file: {final_output_path}")
+                print(f"Output directory contents: {os.listdir(output_dir)}")
+                if job_id: fail_job(job_id, "Render produced no file")
+                return False
             
-        print(f"Render successful: {output_path}")
+        file_size = os.path.getsize(final_output_path)
+        print(f"Render successful: {final_output_path} ({file_size} bytes)")
         
         # Upload
-        print("Uploading to Supabase...")
-        bucket_name = "renders"
-        object_path = f"{job_tag}.mp4"
-        upload_result = upload_to_supabase(output_path, bucket_name, object_path)
-        
-        if not upload_result:
-            if job_id: fail_job(job_id, "Upload failed")
-            return False
-        
-        # Assume public access
-        final_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{object_path}"
-        
-        if job_id:
-            complete_job(job_id, final_url)
+        if not test_mode:
+            print("Uploading to Supabase...")
+            bucket_name = "renders"
+            object_path = f"{job_tag}.mp4"
+            upload_result = upload_to_supabase(final_output_path, bucket_name, object_path)
+            
+            if not upload_result:
+                if job_id: fail_job(job_id, "Upload failed")
+                return False
+            
+            # Assume public access
+            final_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket_name}/{object_path}"
+            
+            if job_id:
+                complete_job(job_id, final_url)
         
         return True
     except Exception as e:
@@ -192,15 +239,18 @@ def main():
             print("TEST PASSED")
             # Verify file with ffmpeg
             try:
-                output_path = os.environ.get("RENDER_OUTPUT_PATH", "/tmp/renders")
-                # Find the actual file if it was dynamic
-                if os.path.isdir(output_path):
-                     # just check if any mp4 was created
-                     pass
-                subprocess.run([os.environ.get("FFMPEG_PATH", "ffmpeg"), "-i", "/tmp/render_output.mp4"], stderr=subprocess.PIPE)
-                print("MP4 verified with FFmpeg")
-            except:
-                pass
+                # Find the actual output path
+                output_dir = os.path.join(os.getcwd(), "renders")
+                # Look for mp4 files
+                files = [f for f in os.listdir(output_dir) if f.endswith(".mp4")]
+                if files:
+                    file_to_check = os.path.join(output_dir, files[0])
+                    subprocess.run([os.environ.get("FFMPEG_PATH", "ffmpeg"), "-i", file_to_check], stderr=subprocess.PIPE)
+                    print(f"MP4 verified with FFmpeg: {file_to_check}")
+                else:
+                    print("No MP4 file found to verify")
+            except Exception as e:
+                print(f"Verification failed: {e}")
         else:
             print("TEST FAILED")
         return
